@@ -1,0 +1,130 @@
+
+======================================================================
+🎙️  FAST SYNTHETIC PODCAST GENERATOR (20-min segment)
+======================================================================
+
+📥 STEP 1: Download Episode
+----------------------------------------------------------------------
+Found RSS feed for Acquired
+Parsing RSS feed: https://feeds.transistor.fm/acquired
+Found episode: Alphabet Inc. (match: 100%)
+File already exists: /Users/michaelhla/podchat/podcast_audio/Acquired_Alphabet Inc..mp3
+
+✓ Audio file ready: /Users/michaelhla/podchat/podcast_audio/Acquired_Alphabet Inc..mp3
+
+
+✂️  STEP 2: Extract First 20 Minutes
+----------------------------------------------------------------------
+✓ 20-minute segment already exists: /Users/michaelhla/podchat/podcast_audio/Acquired_Alphabet Inc._20min.mp3
+
+
+🎙️  STEP 3: Scribe Diarization (20-min segment)
+----------------------------------------------------------------------
+✓ Loaded cached Scribe result
+
+📊 Speaker Statistics (from 20-min segment):
+
+  speaker_0:
+    Words: 3909
+    Total duration: 11.3 min
+    Speech blocks: 38
+    Longest block: 1.5 min
+
+  speaker_1:
+    Words: 3013
+    Total duration: 8.6 min
+    Speech blocks: 45
+    Longest block: 1.4 min
+
+
+🔊 STEP 4: Extract Speaker Audio
+----------------------------------------------------------------------
+Loading 20-minute segment audio...
+
+  Processing speaker_0...
+    Found 38 speech blocks
+    Top 5 longest: ['1.5m', '1.2m', '1.0m', '0.9m', '0.8m']
+      ✓ Added 1.5 min block (total: 1.5 min)
+      ✓ Added 1.2 min block (total: 2.7 min)
+      ✓ Added 1.0 min block (total: 3.7 min)
+      ✓ Added 0.9 min block (total: 4.7 min)
+      ✓ Added 0.8 min block (total: 5.5 min)
+    💾 Saved: /Users/michaelhla/podchat/speaker_audio_scribe/speaker_0.mp3
+
+  Processing speaker_1...
+    Found 45 speech blocks
+    Top 5 longest: ['1.4m', '1.4m', '1.1m', '0.7m', '0.6m']
+      ✓ Added 1.4 min block (total: 1.4 min)
+      ✓ Added 1.4 min block (total: 2.8 min)
+      ✓ Added 1.1 min block (total: 3.9 min)
+      ✓ Added 0.7 min block (total: 4.6 min)
+      ✓ Added 0.6 min block (total: 5.1 min)
+    💾 Saved: /Users/michaelhla/podchat/speaker_audio_scribe/speaker_1.mp3
+
+
+🎤 STEP 5: Create Voice Clones
+----------------------------------------------------------------------
+✓ ElevenLabs client initialized
+
+  Creating voice clone for speaker_0...
+
+🎙️  Creating voice clone: Acquired - speaker_0
+   Files: 1
+   Description: Voice cloned from Acquired podcast - Alphabet Inc.
+✓ Voice clone created!
+  Voice ID: hXRSUO9QgYGi7QoL4Ew3
+    ✓ Voice clone created: hXRSUO9QgYGi7QoL4Ew3
+
+  Creating voice clone for speaker_1...
+
+🎙️  Creating voice clone: Acquired - speaker_1
+   Files: 1
+   Description: Voice cloned from Acquired podcast - Alphabet Inc.
+✓ Voice clone created!
+  Voice ID: vcKT9aboGzRFqo5Q1gd0
+    ✓ Voice clone created: vcKT9aboGzRFqo5Q1gd0
+
+
+🎬 STEP 6: Generate Synthetic Podcast
+----------------------------------------------------------------------
+
+  [1/6] speaker_0: "Hey everyone, welcome back to Acquired!..."
+
+🔊 Generating speech with voice hXRSUO9QgYGi7QoL4Ew3...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+  [2/6] speaker_1: "Today we're doing something a little different - w..."
+
+🔊 Generating speech with voice vcKT9aboGzRFqo5Q1gd0...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+  [3/6] speaker_0: "That's right! These voices you're hearing are actu..."
+
+🔊 Generating speech with voice hXRSUO9QgYGi7QoL4Ew3...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+  [4/6] speaker_1: "Pretty wild, right? The technology has come so far..."
+
+🔊 Generating speech with voice vcKT9aboGzRFqo5Q1gd0...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+  [5/6] speaker_0: "It's amazing what's possible with just ten minutes..."
+
+🔊 Generating speech with voice hXRSUO9QgYGi7QoL4Ew3...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+  [6/6] speaker_1: "Absolutely. Thanks for listening to this experimen..."
+
+🔊 Generating speech with voice vcKT9aboGzRFqo5Q1gd0...
+✗ Failed to generate speech: 'ElevenLabs' object has no attribute 'generate'
+        ❌ Failed
+
+
+🎵 STEP 7: Combine Audio
+----------------------------------------------------------------------
+❌ No audio segments to combine
