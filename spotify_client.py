@@ -276,6 +276,31 @@ class SpotifyClient:
                 print("⚠ API request returned None - possible network/auth issue")
             return False
 
+    def seek_to_position(self, position_ms: int) -> bool:
+        """
+        Seek to a specific position in the currently playing track.
+
+        Args:
+            position_ms: Position in milliseconds to seek to
+
+        Returns:
+            True if successful, False otherwise
+        """
+        response = self._make_api_request("PUT", f"/me/player/seek?position_ms={position_ms}")
+
+        if response and response.status_code in [200, 204]:
+            print(f"Seeked to position {position_ms}ms")
+            return True
+        elif response and response.status_code == 403:
+            print("Error: Requires Spotify Premium")
+            return False
+        elif response and response.status_code == 404:
+            print("⚠ No active device found")
+            return False
+        else:
+            print(f"Failed to seek: {response.status_code if response else 'No response'}")
+            return False
+
     def is_podcast_playing(self) -> bool:
         """
         Check if currently playing media is a podcast episode.

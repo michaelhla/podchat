@@ -312,16 +312,38 @@ class PodcastController:
 
         # Get podcast transcript context for conversation
         podcast_transcript = None
+        extended_transcript_context = None
+        interrupt_timestamp_seconds = None
+        interrupt_sentence = None
+
         if podcast_context and self.transcript_manager.has_transcript():
-            timestamp_seconds = podcast_context['timestamp_ms'] / 1000
+            interrupt_timestamp_seconds = podcast_context['timestamp_ms'] / 1000
+
+            # Get immediate context (30s) for conversation
             podcast_transcript = self.transcript_manager.get_text_at_timestamp(
-                timestamp_seconds,
+                interrupt_timestamp_seconds,
                 context_seconds=30
+            )
+
+            # Get extended context (60s) for rewind point detection
+            extended_transcript_context = self.transcript_manager.get_text_at_timestamp(
+                interrupt_timestamp_seconds,
+                context_seconds=60
+            )
+
+            # Try to extract the sentence being spoken when interrupted
+            # This is a rough approximation - get text within 5 seconds
+            interrupt_sentence = self.transcript_manager.get_text_at_timestamp(
+                interrupt_timestamp_seconds,
+                context_seconds=5
             )
 
         # Enter conversation loop
         conversation_history = []
         turn_count = 0
+        first_user_question = None  # Store first question for rewind analysis
+        rewind_thread = None  # Background thread for rewind detection
+        rewind_result = {"timestamp": None, "transition": None, "audio_file": None}  # Shared result
 
         print("🎙️  Listening... (will exit if you're silent or when conversation naturally ends)\n")
 
@@ -341,6 +363,64 @@ class PodcastController:
 
             print(f"\n📝 You said: \"{text}\"")
             print(f"⏱️  Transcription: {transcribe_time:.2f}s")
+
+            # Store first question and start background rewind detection
+            if first_user_question is None:
+                first_user_question = text
+
+                # Start background thread for rewind detection (only if we have transcript)
+                if interrupt_timestamp_seconds is not None and self.transcript_manager.has_transcript():
+                    from threading import Thread
+
+                    def background_rewind_and_audio():
+                        """Background task: find rewind point and generate transition audio"""
+                        try:
+                            # Find rewind point with LLM
+                            timestamp, transition = self.find_rewind_point(
+                                first_user_question,
+                                interrupt_sentence,
+                                interrupt_timestamp_seconds
+                            )
+                            rewind_result["timestamp"] = timestamp
+                            rewind_result["transition"] = transition
+
+                            # Generate transition audio if we have a transition sentence
+                            if transition and self.current_voice_ids:
+                                from pathlib import Path
+                                import tempfile
+                                import datetime
+                                import random
+
+                                # Pick a random host voice
+                                speaker_id = random.choice(list(self.current_voice_ids.keys()))
+                                voice_id = self.current_voice_ids[speaker_id]
+
+                                # Generate audio file
+                                temp_dir = Path(tempfile.gettempdir()) / "podchat"
+                                temp_dir.mkdir(exist_ok=True)
+                                timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                audio_file = temp_dir / f"transition_{timestamp_str}.mp3"
+
+                                # Generate TTS
+                                audio_generator = self.voice_cloner.client.text_to_speech.convert(
+                                    voice_id=voice_id,
+                                    text=transition,
+                                    model_id="eleven_turbo_v2_5"
+                                )
+
+                                with open(audio_file, 'wb') as f:
+                                    for chunk in audio_generator:
+                                        f.write(chunk)
+
+                                rewind_result["audio_file"] = audio_file
+                                print(f"\n   🎵 Transition audio ready")
+
+                        except Exception as e:
+                            print(f"\n   ⚠ Background rewind error: {e}")
+
+                    rewind_thread = Thread(target=background_rewind_and_audio, daemon=True)
+                    rewind_thread.start()
+                    print(f"   🔄 Finding optimal rewind point in background...")
 
             # Add to conversation history
             conversation_history.append({"role": "user", "text": text})
@@ -367,12 +447,65 @@ class PodcastController:
         # Resume Spotify if it was playing
         if was_playing:
             print(f"\n🔍 DEBUG: About to resume (was_playing={was_playing}, device_id={device_id})")
+
+            # Wait for background rewind detection to complete (if running)
+            if rewind_thread and rewind_thread.is_alive():
+                print(f"⏳ Waiting for rewind analysis to complete...")
+                rewind_thread.join(timeout=10)  # Max 10s wait
+
+            # Play transition audio if available
+            if rewind_result.get("audio_file"):
+                print(f"🎵 Playing transition: \"{rewind_result.get('transition', '')}\"")
+                try:
+                    import wave
+                    import pyaudio
+                    from pydub import AudioSegment
+                    import io
+
+                    # Convert MP3 to WAV in memory
+                    audio = AudioSegment.from_mp3(str(rewind_result["audio_file"]))
+                    wav_io = io.BytesIO()
+                    audio.export(wav_io, format="wav")
+                    wav_io.seek(0)
+
+                    # Play with PyAudio
+                    p = pyaudio.PyAudio()
+                    with wave.open(wav_io, 'rb') as wf:
+                        stream = p.open(
+                            format=p.get_format_from_width(wf.getsampwidth()),
+                            channels=wf.getnchannels(),
+                            rate=wf.getframerate(),
+                            output=True
+                        )
+
+                        data = wf.readframes(1024)
+                        while data:
+                            stream.write(data)
+                            data = wf.readframes(1024)
+
+                        # Drain the buffer to prevent popping
+                        stream.stop_stream()
+                        stream.close()
+                    p.terminate()
+
+                    # Delay to ensure audio device is fully released
+                    import time
+                    time.sleep(0.1)
+
+                except Exception as e:
+                    print(f"⚠ Could not play transition audio: {e}")
+
+            # Seek to rewind point
+            if rewind_result.get("timestamp"):
+                rewind_ms = int(rewind_result["timestamp"] * 1000)
+                print(f"⏪ Rewinding to optimal point...")
+                self.spotify.seek_to_position(rewind_ms)
+
+                # Small delay after seek to let Spotify process
+                import time
+                time.sleep(0.2)
+
             print("▶  Resuming Spotify...")
-
-            # Add small delay to ensure audio device is released
-            import time
-            time.sleep(0.5)
-
             success = self.spotify.resume(device_id=device_id)
             print(f"🔍 DEBUG: Resume returned {success}")
 
@@ -401,12 +534,15 @@ class PodcastController:
         try:
             start_time = time.time()
 
-            # Pick a random speaker
+            # Get all available speakers
             import random
-            speaker_id = random.choice(list(self.current_voice_ids.keys()))
-            voice_id = self.current_voice_ids[speaker_id]
+            available_speakers = list(self.current_voice_ids.keys())
+            num_speakers = len(available_speakers)
 
-            print(f"🔊 Streaming response from {speaker_id}...")
+            if num_speakers > 1:
+                print(f"🔊 Streaming conversational response from {num_speakers} hosts...")
+            else:
+                print(f"🔊 Streaming response from {available_speakers[0]}...")
 
             client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -435,7 +571,31 @@ class PodcastController:
                     context_seconds=30
                 )
 
-            system_prompt = f"""You are one of the hosts of the podcast "{show_name}".
+            # Build speaker list for prompt
+            speaker_list = ", ".join(available_speakers)
+
+            if num_speakers > 1:
+                system_prompt = f"""You are the hosts of the podcast "{show_name}". The hosts are: {speaker_list}.
+You are having a natural conversation with a listener who just paused the episode to ask you something.
+
+FORMAT YOUR RESPONSE AS A CONVERSATION between the hosts using speaker tags. Use the format:
+[{available_speakers[0]}:] First host says something brief
+[{available_speakers[1] if num_speakers > 1 else available_speakers[0]}:] Second host adds to it or responds
+[{available_speakers[0]}:] First host continues...
+
+Your response style should be:
+- Natural back-and-forth conversation between hosts (like you're riffing together)
+- Each host speaks 1-2 sentences max per turn, then the other responds
+- Conversational and warm, like talking to a friend
+- Hosts can build on each other's points, disagree playfully, or add details
+- Keep the TOTAL response brief (3-5 exchanges max)
+- Match the tone and style of the actual podcast
+
+The listener interrupted you mid-episode to ask their question. Pay special attention to what you were saying RIGHT when they paused - that's almost certainly what they're asking about.
+
+IMPORTANT: If the listener's message is just an acknowledgment (like "ok", "thanks", "got it", "that makes sense", "sounds good") with no follow-up question, output ONLY the token [RETURN] to signal the conversation is over and they want to return to the podcast. Do not say anything else when outputting [RETURN]."""
+            else:
+                system_prompt = f"""You are {available_speakers[0]}, a host of the podcast "{show_name}".
 You are having a natural conversation with a listener who just paused the episode to ask you something.
 
 Your response style should be:
@@ -543,6 +703,8 @@ IMPORTANT: If the listener's message is just an acknowledgment (like "ok", "than
             text_buffer = ""
             sentence_count = 0
             full_response = ""
+            current_speaker = None  # Track current speaker from tags
+            default_speaker = available_speakers[0] if available_speakers else None
 
             # Timing variables
             llm_start_time = time.time()
@@ -570,51 +732,142 @@ IMPORTANT: If the listener's message is just an acknowledgment (like "ok", "than
                         should_return = True
                         break
 
-                    # Check for sentence boundaries
-                    sentences = re.split(r'([.!?]+)', text_buffer)
+                    # Process speaker-tagged chunks OR sentences
+                    # Split on speaker tags first (e.g., [Speaker1:], [Speaker2:])
+                    speaker_pattern = r'\[([^\]]+):\]'
+                    parts = re.split(speaker_pattern, text_buffer)
 
-                    # Process complete sentences
-                    while len(sentences) >= 2:
-                        sentence = sentences[0] + (sentences[1] if len(sentences) > 1 else "")
-                        sentence = sentence.strip()
+                    # If we have speaker tags, process by speaker chunks
+                    if len(parts) > 1 and num_speakers > 1:
+                        # parts will be: ['prefix', 'Speaker1', 'text1', 'Speaker2', 'text2', ...]
+                        i = 0
+                        while i < len(parts):
+                            if i == 0:
+                                # Prefix text before first tag (usually empty)
+                                i += 1
+                                continue
 
-                        if sentence and len(sentence) > 3:  # Ignore very short fragments
-                            sentence_count += 1
+                            if i + 1 < len(parts):
+                                potential_speaker = parts[i].strip()
+                                speaker_text = parts[i + 1]
 
-                            # Generate TTS for this sentence
-                            tts_start = time.time()
-                            temp_dir = Path(tempfile.gettempdir()) / "podchat"
-                            temp_dir.mkdir(exist_ok=True)
-                            import datetime
-                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            audio_file = temp_dir / f"stream_{timestamp}_{sentence_count}.mp3"
+                                # Check if this speaker exists in our voice IDs
+                                if potential_speaker in self.current_voice_ids:
+                                    current_speaker = potential_speaker
+                                    voice_id = self.current_voice_ids[current_speaker]
 
-                            # Generate audio
-                            audio_generator = self.voice_cloner.client.text_to_speech.convert(
-                                voice_id=voice_id,
-                                text=sentence,
-                                model_id="eleven_turbo_v2_5",
-                                optimize_streaming_latency=4  # Max latency optimization
-                            )
+                                    # Process sentences within this speaker's chunk
+                                    sentences = re.split(r'([.!?]+)', speaker_text)
 
-                            with open(audio_file, 'wb') as f:
-                                for chunk in audio_generator:
-                                    f.write(chunk)
+                                    # Only process complete sentences
+                                    while len(sentences) >= 2:
+                                        sentence = sentences[0] + (sentences[1] if len(sentences) > 1 else "")
+                                        sentence = sentence.strip()
 
-                            tts_time = time.time() - tts_start
-                            tts_times.append(tts_time)
+                                        if sentence and len(sentence) > 3:
+                                            sentence_count += 1
 
-                            # Queue for playback
-                            audio_queue.put((audio_file, sentence))
+                                            # Generate TTS for this sentence
+                                            tts_start = time.time()
+                                            temp_dir = Path(tempfile.gettempdir()) / "podchat"
+                                            temp_dir.mkdir(exist_ok=True)
+                                            import datetime
+                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            audio_file = temp_dir / f"stream_{timestamp}_{sentence_count}.mp3"
 
-                            if not playback_started:
-                                playback_started = True
-                                first_audio_time = time.time() - start_time
-                                print(f"▶️  Playing (first audio: {first_audio_time:.1f}s)")
+                                            # Generate audio with correct voice
+                                            audio_generator = self.voice_cloner.client.text_to_speech.convert(
+                                                voice_id=voice_id,
+                                                text=sentence,
+                                                model_id="eleven_turbo_v2_5",
+                                                optimize_streaming_latency=4
+                                            )
 
-                        # Remove processed sentence
-                        text_buffer = ''.join(sentences[2:])
+                                            with open(audio_file, 'wb') as f:
+                                                for chunk in audio_generator:
+                                                    f.write(chunk)
+
+                                            tts_time = time.time() - tts_start
+                                            tts_times.append(tts_time)
+
+                                            # Queue for playback
+                                            audio_queue.put((audio_file, sentence))
+
+                                            if not playback_started:
+                                                playback_started = True
+                                                first_audio_time = time.time() - start_time
+                                                print(f"▶️  [{current_speaker}] Playing (first audio: {first_audio_time:.1f}s)")
+                                            else:
+                                                print(f"   [{current_speaker}] {sentence[:60]}...")
+
+                                        # Remove processed sentence
+                                        sentences = sentences[2:]
+
+                                    # Update text_buffer with remaining incomplete text
+                                    remaining_text = ''.join(sentences)
+                                    if i + 2 < len(parts):
+                                        # More speaker tags ahead, keep processing
+                                        text_buffer = f"[{parts[i+2]}:]" + parts[i+3] if i + 3 < len(parts) else ""
+                                        i += 2
+                                    else:
+                                        # This is the last chunk, keep remainder
+                                        text_buffer = remaining_text
+                                        break
+                                else:
+                                    # Unknown speaker, skip
+                                    i += 2
+                            else:
+                                break
+                    else:
+                        # No speaker tags (single speaker mode or no tags yet) - use default behavior
+                        if current_speaker is None and default_speaker:
+                            current_speaker = default_speaker
+                            voice_id = self.current_voice_ids[current_speaker]
+
                         sentences = re.split(r'([.!?]+)', text_buffer)
+
+                        # Process complete sentences
+                        while len(sentences) >= 2:
+                            sentence = sentences[0] + (sentences[1] if len(sentences) > 1 else "")
+                            sentence = sentence.strip()
+
+                            if sentence and len(sentence) > 3:
+                                sentence_count += 1
+
+                                # Generate TTS for this sentence
+                                tts_start = time.time()
+                                temp_dir = Path(tempfile.gettempdir()) / "podchat"
+                                temp_dir.mkdir(exist_ok=True)
+                                import datetime
+                                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                audio_file = temp_dir / f"stream_{timestamp}_{sentence_count}.mp3"
+
+                                # Generate audio
+                                audio_generator = self.voice_cloner.client.text_to_speech.convert(
+                                    voice_id=voice_id,
+                                    text=sentence,
+                                    model_id="eleven_turbo_v2_5",
+                                    optimize_streaming_latency=4
+                                )
+
+                                with open(audio_file, 'wb') as f:
+                                    for chunk in audio_generator:
+                                        f.write(chunk)
+
+                                tts_time = time.time() - tts_start
+                                tts_times.append(tts_time)
+
+                                # Queue for playback
+                                audio_queue.put((audio_file, sentence))
+
+                                if not playback_started:
+                                    playback_started = True
+                                    first_audio_time = time.time() - start_time
+                                    print(f"▶️  Playing (first audio: {first_audio_time:.1f}s)")
+
+                            # Remove processed sentence
+                            text_buffer = ''.join(sentences[2:])
+                            sentences = re.split(r'([.!?]+)', text_buffer)
 
                 # Check if [RETURN] was detected
                 if should_return:
@@ -683,6 +936,223 @@ IMPORTANT: If the listener's message is just an acknowledgment (like "ok", "than
 
         print("-" * 60)
         return False
+
+    def get_transcript_with_timestamps(self, center_timestamp: float, context_seconds: int = 60) -> str:
+        """
+        Get transcript formatted with timestamps for LLM analysis.
+
+        Args:
+            center_timestamp: Center point in seconds
+            context_seconds: Seconds of context around center
+
+        Returns:
+            Formatted transcript with timestamps
+        """
+        if not self.transcript_manager.has_transcript():
+            return None
+
+        transcript = self.transcript_manager.get_full_transcript()
+        if not transcript:
+            return None
+
+        # Find segments within range
+        start_time = max(0, center_timestamp - context_seconds)
+        end_time = center_timestamp + context_seconds
+
+        relevant_segments = []
+        for segment in transcript:
+            seg_start = segment['start']
+            seg_end = seg_start + segment['duration']
+            if seg_start <= end_time and seg_end >= start_time:
+                relevant_segments.append(segment)
+
+        if not relevant_segments:
+            return None
+
+        # Format with timestamps
+        formatted = []
+        for segment in relevant_segments:
+            timestamp_sec = segment['start']
+            mins = int(timestamp_sec // 60)
+            secs = int(timestamp_sec % 60)
+            formatted.append(f"[{mins}:{secs:02d}] {segment['text']}")
+
+        return '\n'.join(formatted)
+
+    def find_rewind_point(self, user_question: str, interrupt_sentence: Optional[str],
+                          interrupt_timestamp: float) -> tuple[float, Optional[str]]:
+        """
+        Use LLM to intelligently find where to rewind to (start of current thought).
+
+        Args:
+            user_question: The user's first question in the conversation
+            interrupt_sentence: The sentence being spoken when paused
+            interrupt_timestamp: When the interrupt happened (in seconds)
+
+        Returns:
+            Tuple of (timestamp to rewind to in seconds, transition sentence)
+        """
+        import anthropic
+        import os
+        import re
+
+        print("\n🔍 Finding optimal rewind point...")
+
+        try:
+            # Get transcript with timestamps
+            transcript_context = self.get_transcript_with_timestamps(interrupt_timestamp, context_seconds=45)
+
+            if not transcript_context:
+                print(f"   ⚠ No transcript available, using 10s rewind")
+                return (max(0, interrupt_timestamp - 10), None)
+
+            # Debug: show first few lines of transcript
+            lines = transcript_context.split('\n')
+            print(f"   📝 Transcript has {len(lines)} lines")
+            if len(lines) > 0:
+                print(f"   First line: {lines[0][:80]}...")
+                print(f"   Last line: {lines[-1][:80]}...")
+
+            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+            # Calculate valid range
+            min_allowed = max(0, interrupt_timestamp - 30)
+            min_mins = int(min_allowed // 60)
+            min_secs = int(min_allowed % 60)
+            interrupt_mins = int(interrupt_timestamp // 60)
+            interrupt_secs = int(interrupt_timestamp % 60)
+
+            print(f"   Valid range: {min_mins}:{min_secs:02d} to {interrupt_mins}:{interrupt_secs:02d}")
+
+            # Get show name for transition sentence
+            status = self.spotify.get_playback_status()
+            show_name = status.get("show", "the podcast")
+
+            # Build prompt for LLM - with transition sentence generation
+            prompt = f"""Find the best rewind point for a podcast and create a smooth transition.
+
+INTERRUPT TIME: {interrupt_mins}:{interrupt_secs:02d}
+VALID RANGE: Any timestamp between {min_mins}:{min_secs:02d} and {interrupt_mins}:{interrupt_secs:02d}
+
+USER ASKED: "{user_question}"
+
+TRANSCRIPT WITH TIMESTAMPS:
+{transcript_context}
+
+TASK 1 - Find Rewind Point:
+Find where the current thought/topic started. Look for:
+- Natural topic transitions: "Now...", "So...", "The key thing is...", "Let me explain..."
+- Sentence boundaries - MUST be at the START of a sentence, never mid-sentence
+- The beginning of a complete thought/idea
+
+CRITICAL RULES:
+1. Timestamp MUST be between {min_mins}:{min_secs:02d} and {interrupt_mins}:{interrupt_secs:02d}
+2. MUST be at the START of a sentence (look for capital letters after periods/question marks)
+3. IMPORTANT: Transcript segments may contain multiple sentences. You need to:
+   - Identify where in the text the sentence/thought actually starts
+   - Find the timestamp of that segment
+   - Estimate how many seconds into that segment the sentence begins
+   - Calculate: base_timestamp + estimated_offset
+   - Example: [224:46] contains "maybe up to 50%. But this is going to be..."
+     → Sentence "But this is..." starts ~2 seconds into this segment
+     → Return timestamp: 224:48
+4. If unsure, subtract 15 seconds from {interrupt_mins}:{interrupt_secs:02d}
+
+TASK 2 - Create Transition Sentence:
+Write a brief, natural transition sentence (1-2 sentences max) that the podcast host would say to smoothly return to the episode. Should sound like:
+- "Alright, let's get back to where we were..."
+- "Good question! Now, picking up where we left off..."
+- "Thanks for asking! So, back to what we were discussing..."
+
+OUTPUT FORMAT (exactly 3 lines):
+Line 1: TIMESTAMP: M:SS or MM:SS
+Line 2: TEXT_AT_POINT: [first few words at that timestamp]
+Line 3: TRANSITION: [your transition sentence]
+
+Example:
+TIMESTAMP: 224:48
+TEXT_AT_POINT: But this is going to be
+TRANSITION: Great question! So as we were saying..."""
+
+            # Debug: print prompt
+            print(f"\n   📋 LLM Prompt Preview:")
+            print(f"   " + "="*60)
+            prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
+            for line in prompt_preview.split('\n'):
+                print(f"   {line}")
+            print(f"   " + "="*60)
+
+            # Call Claude Sonnet 4.5 for better reasoning
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=150,  # Need space for timestamp + transition
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = response.content[0].text.strip()
+            print(f"   LLM response:\n{response_text}")
+
+            # Parse the response - looking for TIMESTAMP, TEXT_AT_POINT, and TRANSITION lines
+            timestamp_match = re.search(r'TIMESTAMP:\s*(\d+):(\d+)', response_text)
+            text_at_point_match = re.search(r'TEXT_AT_POINT:\s*(.+)', response_text)
+            transition_match = re.search(r'TRANSITION:\s*(.+)', response_text, re.DOTALL)
+
+            transition_sentence = None
+            text_at_point = None
+
+            if text_at_point_match:
+                text_at_point = text_at_point_match.group(1).strip()
+                print(f"   📍 Text at rewind: \"{text_at_point}\"")
+
+            if transition_match:
+                transition_sentence = transition_match.group(1).strip()
+                print(f"   💬 Transition: \"{transition_sentence}\"")
+
+            if timestamp_match:
+                minutes = int(timestamp_match.group(1))
+                seconds = int(timestamp_match.group(2))
+                suggested_timestamp = minutes * 60 + seconds
+
+                # Debug the validation
+                print(f"   🔍 Debug: suggested={suggested_timestamp}s, min_allowed={min_allowed}s, max_allowed={interrupt_timestamp}s")
+
+                # Validate: must be within 30s before interrupt, and not after
+                # Add 2-second tolerance for rounding/transcript boundaries
+                max_allowed = interrupt_timestamp
+                tolerance = 2
+
+                if (min_allowed - tolerance) <= suggested_timestamp <= max_allowed:
+                    rewind_seconds = interrupt_timestamp - suggested_timestamp
+                    print(f"   ✓ Rewinding {rewind_seconds:.0f}s to {minutes}:{seconds:02d}")
+
+                    # Show context around the rewind point
+                    transcript = self.transcript_manager.get_full_transcript()
+                    if transcript:
+                        print(f"\n   📍 Context at rewind point:")
+                        for segment in transcript:
+                            seg_time = segment['start']
+                            # Show segments within ±10 seconds of rewind point
+                            if suggested_timestamp - 10 <= seg_time <= suggested_timestamp + 10:
+                                seg_mins = int(seg_time // 60)
+                                seg_secs = int(seg_time % 60)
+                                marker = "👉" if abs(seg_time - suggested_timestamp) < 3 else "  "
+                                print(f"   {marker} [{seg_mins}:{seg_secs:02d}] {segment['text'][:70]}")
+
+                    return (suggested_timestamp, transition_sentence)
+                else:
+                    print(f"   ⚠ Timestamp {minutes}:{seconds:02d} out of valid range ({min_mins}:{min_secs:02d} to {interrupt_mins}:{interrupt_secs:02d}), using 10s rewind")
+                    print(f"   🔍 Debug: Check failed: {min_allowed} <= {suggested_timestamp} <= {max_allowed} = {min_allowed <= suggested_timestamp <= max_allowed}")
+                    return (max(0, interrupt_timestamp - 10), transition_sentence)
+            else:
+                print(f"   ⚠ Could not parse timestamp, using 10s rewind")
+                return (max(0, interrupt_timestamp - 10), transition_sentence)
+
+        except Exception as e:
+            print(f"   ⚠ Error finding rewind point: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback: rewind 10 seconds
+            return (max(0, interrupt_timestamp - 10), None)
 
     def generate_host_echo(self, audio_file: Path):
         """Use voice-to-voice to echo user's words in a host's voice (FAST)."""
@@ -915,9 +1385,9 @@ Timestamp: {podcast_context['timestamp']} / {podcast_context['total_time']}
     def run(self):
         """Run the interactive CLI."""
         print("""
-╔═══════════════════════════════════════════════════════════════╗
-║          Spotify Podcast Controller - CLI Mode                 ║
-╚═══════════════════════════════════════════════════════════════╝
+===============================================================
+          Spotify Podcast Controller - CLI Mode
+===============================================================
 
 Commands:
   pause, p          - Pause playback
